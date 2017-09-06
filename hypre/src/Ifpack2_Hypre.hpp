@@ -60,6 +60,8 @@
 
 #include "Teuchos_RCP.hpp"
 
+#include <cmath>
+
 namespace Ifpack2 {
 
 #ifndef HYPRE_ENUMS
@@ -487,6 +489,11 @@ public:
   //! Returns the number of flops in the apply inverse phase.
   virtual double ApplyInverseFlops() const{ return(ApplyInverseFlops_);}
 
+    //! Number of linear iterations
+    mutable int hypreNumLinIters_;
+
+    //! Final residuals
+    mutable double hypreFinalResidual_;
 private:
 
   // @}
@@ -649,6 +656,9 @@ private:
   int (*PrecondSetupPtr_)(HYPRE_Solver, HYPRE_ParCSRMatrix, HYPRE_ParVector, HYPRE_ParVector);
   int (*PrecondSolvePtr_)(HYPRE_Solver, HYPRE_ParCSRMatrix, HYPRE_ParVector, HYPRE_ParVector);
 
+    int (*SolverNumItersPtr_)(HYPRE_Solver, int*);
+    int (*SolverFinalResidualNormPtr_)(HYPRE_Solver, double*);
+
   bool *IsSolverSetup_;
   bool *IsPrecondSetup_;
   //! Is the system to be solved or apply preconditioner
@@ -663,6 +673,10 @@ private:
   bool UsePreconditioner_;
   //! This contains a list of function pointers that will be called in compute
   std::vector<Teuchos::RCP<FunctionParameter> > FunsToCall_;
+
+    int hypreILower_;
+    int hypreIUpper_;
+
 };
 
 
@@ -702,14 +716,29 @@ Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::Ifpack2_Hypre(const Teuch
   // NOTE: Maps are only considered to be contiguous if they were generated using a
   // particular constructor.  Otherwise, LinearMap() will not detect whether they are
   // actually contiguous.
-  TEUCHOS_TEST_FOR_EXCEPTION(!A_->getDomainMap()->isContiguous(), std::runtime_error,
-      Teuchos::typeName (*this) << "::apply(): A's domain map must be contiguous for hypre.");
+  //TEUCHOS_TEST_FOR_EXCEPTION(!A_->getDomainMap()->isContiguous(), std::runtime_error,
+      //Teuchos::typeName (*this) << "::apply(): A's domain map must be contiguous for hypre.");
 
   TEUCHOS_TEST_FOR_EXCEPTION(!A_->getDomainMap()->isSameAs(*A_->getRangeMap()), std::runtime_error,
       Teuchos::typeName (*this) << "::apply(): A's domain and range map must be the same for hypre.");
 
-  int ilower = A_->getDomainMap()->getMinGlobalIndex();
-  int iupper = A_->getDomainMap()->getMaxGlobalIndex();
+  int nprocs, iproc;
+  MPI_Comm_size(comm, &nprocs);
+  MPI_Comm_rank(comm, &iproc);
+  int igmin = A_->getDomainMap()->getMinGlobalIndex();
+  int igmax = A_->getDomainMap()->getMaxGlobalIndex();
+  int gIdxMin, gIdxMax;
+  MPI_Allreduce(&igmin, &gIdxMin, 1, MPI_INT, MPI_MIN, comm);
+  MPI_Allreduce(&igmax, &gIdxMax, 1, MPI_INT, MPI_MAX, comm);
+
+  int numRows = (gIdxMax - gIdxMin + 1);
+  int rowsPerRank = numRows / nprocs;
+  int remRows = numRows % nprocs;
+  int extraRow = (iproc < remRows)? 1 : 0;
+  int rowOffset = (iproc < remRows)? iproc : remRows;
+
+  int ilower = iproc * rowsPerRank + rowOffset + gIdxMin;
+  int iupper = ilower + rowsPerRank + extraRow - gIdxMin;
 
   // Next create vectors that will be used when ApplyInverse() is called
   HYPRE_IJVectorCreate(comm, ilower, iupper, &XHypre_);
@@ -766,11 +795,38 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::initialize(){
     Teuchos::TimeMonitor timeMon (*timer);
 
     MPI_Comm comm = GetMpiComm();
-    int ilower = A_->getDomainMap()->getMinGlobalIndex();
-    int iupper = A_->getDomainMap()->getMaxGlobalIndex();
+    // int ilower = A_->getDomainMap()->getMinGlobalIndex();
+    // int iupper = A_->getDomainMap()->getMaxGlobalIndex();
+
+    int nprocs, iproc;
+    MPI_Comm_size(comm, &nprocs);
+    MPI_Comm_rank(comm, &iproc);
+    int igmin = A_->getDomainMap()->getMinGlobalIndex();
+    int igmax = A_->getDomainMap()->getMaxGlobalIndex();
+    int gIdxMin, gIdxMax;
+    MPI_Allreduce(&igmin, &gIdxMin, 1, MPI_INT, MPI_MIN, comm);
+    MPI_Allreduce(&igmax, &gIdxMax, 1, MPI_INT, MPI_MAX, comm);
+
+    int numRows = (gIdxMax - gIdxMin + 1);
+    int rowsPerRank = numRows / nprocs;
+    int remRows = numRows % nprocs;
+    int extraRow = (iproc < remRows)? 1 : 0;
+    int rowOffset = (iproc < remRows)? iproc : remRows;
+
+    int ilower = iproc * rowsPerRank + rowOffset + gIdxMin;
+    int iupper = ilower + rowsPerRank + extraRow - gIdxMin;
     HYPRE_IJMatrixCreate(comm, ilower, iupper, ilower, iupper, &HypreA_);
     HYPRE_IJMatrixSetObjectType(HypreA_, HYPRE_PARCSR);
     HYPRE_IJMatrixInitialize(HypreA_);
+
+    // int hnrows = 1;
+    // int hncols = 1;
+    // double temp = 1.0;
+    // for(int i=ilower; i <= iupper; i++)
+    //     HYPRE_IJMatrixSetValues(HypreA_, hnrows, &hncols, &i, &i, &temp);
+
+    std::cerr << ilower << "\t" << iupper << "\t" << numRows << "\t"
+              << A_->getNodeNumRows() << std::endl;
     for(size_t i = 0; i < A_->getNodeNumRows(); i++){
       int numElements = A_->getNumEntriesInLocalRow(i);
       Teuchos::Array<LocalOrdinal> indices(numElements);
@@ -786,6 +842,19 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::initialize(){
     }
     HYPRE_IJMatrixAssemble(HypreA_);
     HYPRE_IJMatrixGetObject(HypreA_, (void**)&ParMatrix_);
+
+    // int hnrows=1;
+    // int hncols=1;
+    // double getval;
+    // double setval=1.0;
+    // for (int i=ilower; i<=iupper; i++) {
+    //     HYPRE_IJMatrixGetValues(HypreA_, hnrows, &hncols, &i, &i, &getval);
+    //     if (std::fabs(getval) < 1.0e-8) {
+    //         HYPRE_IJMatrixAddToValues(HypreA_, hnrows, &hncols, &i, &i, &setval);
+    //     }
+    // }
+    // HYPRE_IJMatrixAssemble(HypreA_);
+    // HYPRE_IJMatrixGetObject(HypreA_, (void**)&ParMatrix_);
   } // Stop timer here
 
   isInitialized_=true;
@@ -965,6 +1034,7 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::apply(const Tpetra::
     size_t NumVectors = X.getNumVectors();
     TEUCHOS_TEST_FOR_EXCEPTION(NumVectors != Y.getNumVectors(), std::runtime_error,
          Teuchos::typeName (*this) << "::apply(): X and Y must have the same number of vectors.");
+    /*
     for(size_t VecNum = 0; VecNum < NumVectors; VecNum++) {
       //Get values for current vector in multivector.
       Teuchos::ArrayRCP<const double> XValues = X.getData(VecNum);
@@ -977,7 +1047,14 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::apply(const Tpetra::
       XLocal_->data = const_cast<double*>(XValues.get()); 
       double *YTemp = YLocal_->data;
       YLocal_->data = YValues.get();
-  
+
+      // HYPRE_IJMatrixPrint(HypreA_, "IJ.out.A.smalltoZero");
+      HYPRE_IJVectorPrint(XHypre_, "IJ.out.b.smalltoZero");
+
+      // HYPRE_IJVectorAssemble(XHypre_);
+      // HYPRE_IJVectorGetObject(XHypre_, (void**) &ParX_);
+      // HYPRE_IJVectorAssemble(YHypre_);
+      // HYPRE_IJVectorGetObject(YHypre_, (void**) &ParY_);
       HYPRE_ParVectorSetConstantValues(ParY_, 0.0);
       if(SolveOrPrec_ == Hypre::Solver){
         // Use the solver methods
@@ -986,8 +1063,50 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::apply(const Tpetra::
         // Apply the preconditioner
         PrecondSolvePtr_(Preconditioner_, ParMatrix_, ParX_, ParY_);
       }
+      // HYPRE_IJVectorPrint(YHypre_, "IJ.out.x");
       XLocal_->data = XTemp;
       YLocal_->data = YTemp;
+      // SolverNumItersPtr_(Solver_, &hypreNumLinIters_);
+      // SolverFinalResidualNormPtr_(Solver_, &hypreFinalResidual_);
+    }
+    */
+
+    for (size_t VecNum=0; VecNum < NumVectors; VecNum++) {
+        auto rhsVec = X.getVector(VecNum);
+        auto rhsView = rhsVec->get1dView();
+        auto rhsMap = rhsVec->getMap();
+        auto limin = rhsMap->getMinLocalIndex();
+        auto limax = rhsMap->getMaxLocalIndex();
+
+        for (int i=limin; i <= limax; i++) {
+            int ig = rhsMap->getGlobalElement(i);
+            double value = rhsView[i];
+            HYPRE_IJVectorAddToValues(XHypre_, 1, &ig, &value);
+        }
+        HYPRE_IJVectorAssemble(XHypre_);
+        HYPRE_IJVectorGetObject(XHypre_, (void**) &ParX_);
+        // HYPRE_IJMatrixPrint(HypreA_, "IJ.out.A");
+        // HYPRE_IJVectorPrint(XHypre_, "IJ.out.b");
+
+        HYPRE_ParVectorSetConstantValues(ParY_, 0.0);
+        if(SolveOrPrec_ == Hypre::Solver){
+            // Use the solver methods
+            SolverSolvePtr_(Solver_, ParMatrix_, ParX_, ParY_);
+        } else {
+            // Apply the preconditioner
+            PrecondSolvePtr_(Preconditioner_, ParMatrix_, ParX_, ParY_);
+        }
+
+        auto slnData = Y.getDataNonConst(VecNum);
+        double outval;
+        for (int i=limin; i <= limax; i++) {
+            int ig = rhsMap->getGlobalElement(i);
+            HYPRE_IJVectorGetValues(YHypre_, 1, &ig, &outval);
+            slnData[i] = outval;
+        }
+        // HYPRE_IJVectorPrint(YHypre_,"IJ.out.x");
+        SolverNumItersPtr_(Solver_, &hypreNumLinIters_);
+        SolverFinalResidualNormPtr_(Solver_, &hypreFinalResidual_);
     }
   } // Stop timer here
 
@@ -1060,6 +1179,8 @@ int Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::SetSolverType(Hypre::
       SolverSetupPtr_ = &HYPRE_BoomerAMGSetup;
       SolverPrecondPtr_ = NULL;
       SolverSolvePtr_ = &HYPRE_BoomerAMGSolve;
+      SolverNumItersPtr_ = &HYPRE_BoomerAMGGetNumIterations;
+      SolverFinalResidualNormPtr_ = &HYPRE_BoomerAMGGetFinalRelativeResidualNorm;
       break;
     case Hypre::AMS:
       if(IsSolverSetup_[0]){
@@ -1071,6 +1192,8 @@ int Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::SetSolverType(Hypre::
       SolverSetupPtr_ = &HYPRE_AMSSetup;
       SolverSolvePtr_ = &HYPRE_AMSSolve;
       SolverPrecondPtr_ = NULL;
+      SolverNumItersPtr_ = &HYPRE_AMSGetNumIterations;
+      SolverFinalResidualNormPtr_ = &HYPRE_AMSGetFinalRelativeResidualNorm;
       break;
     case Hypre::Hybrid:
       if(IsSolverSetup_[0]){
@@ -1093,6 +1216,8 @@ int Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::SetSolverType(Hypre::
       SolverSetupPtr_ = &HYPRE_ParCSRPCGSetup;
       SolverSolvePtr_ = &HYPRE_ParCSRPCGSolve;
       SolverPrecondPtr_ = &HYPRE_ParCSRPCGSetPrecond;
+      SolverNumItersPtr_ = &HYPRE_PCGGetNumIterations;
+      SolverFinalResidualNormPtr_ = &HYPRE_PCGGetFinalRelativeResidualNorm;
       break;
     case Hypre::GMRES:
       if(IsSolverSetup_[0]){
@@ -1102,7 +1227,10 @@ int Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::SetSolverType(Hypre::
       SolverCreatePtr_ = &Ifpack2_Hypre::Hypre_ParCSRGMRESCreate;
       SolverDestroyPtr_ = &HYPRE_ParCSRGMRESDestroy;
       SolverSetupPtr_ = &HYPRE_ParCSRGMRESSetup;
+      SolverSolvePtr_ = &HYPRE_ParCSRGMRESSolve;
       SolverPrecondPtr_ = &HYPRE_ParCSRGMRESSetPrecond;
+      SolverNumItersPtr_ = &HYPRE_GMRESGetNumIterations;
+      SolverFinalResidualNormPtr_ = &HYPRE_GMRESGetFinalRelativeResidualNorm;
       break;
     case Hypre::FlexGMRES:
       if(IsSolverSetup_[0]){
@@ -1114,6 +1242,8 @@ int Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::SetSolverType(Hypre::
       SolverSetupPtr_ = &HYPRE_ParCSRFlexGMRESSetup;
       SolverSolvePtr_ = &HYPRE_ParCSRFlexGMRESSolve;
       SolverPrecondPtr_ = &HYPRE_ParCSRFlexGMRESSetPrecond;
+      SolverNumItersPtr_ = &HYPRE_FlexGMRESGetNumIterations;
+      SolverFinalResidualNormPtr_ = &HYPRE_FlexGMRESGetFinalRelativeResidualNorm;
       break;
     case Hypre::LGMRES:
       if(IsSolverSetup_[0]){
