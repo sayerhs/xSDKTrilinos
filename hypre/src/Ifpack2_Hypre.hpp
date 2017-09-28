@@ -707,6 +707,12 @@ void Ifpack2_Hypre<Scalar, LocalOrdinal, GlobalOrdinal, Node>::initHypreDataStru
     YVec_ = (hypre_ParVector *) hypre_IJVectorObject(((hypre_IJVector *) YHypre_));
     YLocal_ = hypre_ParVectorLocalVector(YVec_);
 
+    // std::cerr << std::to_string(Comm()->getRank()) + "\t"
+    //     + std::to_string(hypreILower_) + "\t" + std::to_string(hypreIUpper_) + "\t"
+    //     + std::to_string(A_->getDomainMap()->getMinGlobalIndex()) + "\t"
+    //     + std::to_string(A_->getDomainMap()->getMaxGlobalIndex()) + "\t"
+    //     + std::to_string(A_->getNodeNumRows()) + "\t"
+    //     + std::to_string(hypreIUpper_ - hypreILower_ + 1) << std::endl;
 }
 
 template<class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
@@ -736,13 +742,13 @@ void Ifpack2_Hypre<Scalar,LocalOrdinal,GlobalOrdinal,Node>::processLocalMatrixIn
 
     // hypreILower_ = startIdx[iproc];
     // hypreIUpper_ = nLocalRows - 1;
-    if (Comm()->getRank() == 2)
-    std::cerr << std::to_string(Comm()->getRank()) + "\t"
-        + std::to_string(hypreILower_) + "\t" + std::to_string(hypreIUpper_) + "\t"
-        + std::to_string(A_->getDomainMap()->getMinGlobalIndex()) + "\t"
-        + std::to_string(A_->getDomainMap()->getMaxGlobalIndex()) + "\t"
-        + std::to_string(A_->getNodeNumRows()) + "\t"
-        + std::to_string(hypreIUpper_ - hypreILower_ + 1) << std::endl;
+    // if (Comm()->getRank() == 2)
+    // std::cerr << std::to_string(Comm()->getRank()) + "\t"
+    //     + std::to_string(hypreILower_) + "\t" + std::to_string(hypreIUpper_) + "\t"
+    //     + std::to_string(A_->getDomainMap()->getMinGlobalIndex()) + "\t"
+    //     + std::to_string(A_->getDomainMap()->getMaxGlobalIndex()) + "\t"
+    //     + std::to_string(A_->getNodeNumRows()) + "\t"
+    //     + std::to_string(hypreIUpper_ - hypreILower_ + 1) << std::endl;
 }
 
 //==============================================================================
